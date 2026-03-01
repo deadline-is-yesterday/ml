@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LiveAud Test</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #1a1a2e; color: #eee;
+            display: flex; justify-content: center; align-items: center;
+            min-height: 100vh;
+        }
+        .panel {
+            background: #16213e; border-radius: 16px; padding: 32px;
+            width: 400px; text-align: center;
+            box-shadow: 0 8px 32px rgba(0,0,0,.4);
+        }
+        h1 { font-size: 1.3rem; margin-bottom: 8px; }
+        .subtitle { color: #888; font-size: .85rem; margin-bottom: 24px; }
+        #talkBtn {
+            width: 120px; height: 120px; border-radius: 50%;
+            border: none; cursor: pointer;
+            background: #e94560; color: #fff;
+            font-size: 1rem; font-weight: 600;
+            transition: all .15s;
+            display: flex; align-items: center; justify-content: center;
+            margin: 0 auto 20px;
+        }
+        #talkBtn:hover { transform: scale(1.05); }
+        #talkBtn.active { background: #4ecca3; transform: scale(1.1); }
+        #talkBtn:disabled { background: #555; cursor: not-allowed; transform: none; }
+        #status {
+            font-size: .9rem; color: #aaa; min-height: 1.5em;
+            margin-bottom: 12px;
+        }
+        #log {
+            background: #0f3460; border-radius: 8px; padding: 12px;
+            font-size: .75rem; color: #7ec8e3; text-align: left;
+            max-height: 200px; overflow-y: auto;
+            font-family: monospace;
+        }
+        #log div { margin-bottom: 2px; }
+    </style>
+</head>
+<body>
+<div class="panel">
+    <h1>🎙 LiveAud Test</h1>
+    <p class="subtitle">Нажми кнопку — начнётся сеанс с ИИ</p>
+    <div id="status">Не подключено</div>
+    <button id="talkBtn" disabled>Подключить</button>
+    <div id="log"></div>
+</div>
+
+<script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+<script>
+const LIVEAUD_URL = location.hostname === 'localhost'
+    ? 'http://localhost:5001'
+    : `http://${location.hostname}:5001`;
+
+const SEND_RATE = 16000;
+const RECV_RATE = 24000;
+const CHUNK = 512;
+
+const btn = document.getElementById('talkBtn');
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+
+let socket = null;
+let audioCtx = null;
+let micStream = null;
+let workletNode = null;
+let connected = false;
+
+function log(msg) {
+    const d = document.createElement('div');
+    d.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    logEl.prepend(d);
+    if (logEl.children.length > 100) logEl.lastChild.remove();
+}
+
+// ── Playback ────────────────────────────────────────────────────────────────
+
+// We collect received PCM chunks and play them in order
+let playQueue = [];
+let isPlaying = false;
+
+function enqueueAudio(pcmBytes) {
+    // pcmBytes is Int16 24kHz mono → Float32
+    const int16 = new Int16Array(pcmBytes);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) {
+        float32[i] = int16[i] / 32768;
+    }
+    playQueue.push(float32);
+    if (!isPlaying) playNext();
+}
+
+function playNext() {
+    if (playQueue.length === 0) { isPlaying = false; return; }
+    isPlaying = true;
+    const samples = playQueue.shift();
+    const buf = audioCtx.createBuffer(1, samples.length, RECV_RATE);
+    buf.getChannelData(0).set(samples);
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtx.destination);
+    src.onended = playNext;
+    src.start();
+}
+
+// ── Mic capture via AudioWorklet ────────────────────────────────────────────
+
+const WORKLET_CODE = `
+class PcmProcessor extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        this.buffer = new Float32Array(0);
+        // Downsample ratio: native sampleRate → 16000
+        this.ratio = sampleRate / 16000;
+    }
+    process(inputs) {
+        const input = inputs[0];
+        if (!input || !input[0]) return true;
+        const data = input[0];
+
+        // Downsample by picking every Nth sample
+        const outLen = Math.floor(data.length / this.ratio);
+        const downsampled = new Float32Array(outLen);
+        for (let i = 0; i < outLen; i++) {
+            downsampled[i] = data[Math.round(i * this.ratio)];
+        }
+
+        // Accumulate
+        const newBuf = new Float32Array(this.buffer.length + downsampled.length);
+        newBuf.set(this.buffer);
+        newBuf.set(downsampled, this.buffer.length);
+        this.buffer = newBuf;
+
+        // Emit chunks of 512 samples (at 16kHz)
+        while (this.buffer.length >= 512) {
+            const chunk = this.buffer.slice(0, 512);
+            this.buffer = this.buffer.slice(512);
+            const int16 = new Int16Array(512);
+            for (let i = 0; i < 512; i++) {
+                const s = Math.max(-1, Math.min(1, chunk[i]));
+                int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            this.port.postMessage(int16.buffer, [int16.buffer]);
+        }
+        return true;
+    }
+}
+registerProcessor('pcm-processor', PcmProcessor);
+`;
+
+async function startMic() {
+    micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true }
+    });
+
+    // Use native sample rate — downsample happens in the worklet
+    audioCtx = new AudioContext();
+    log('AudioContext sampleRate: ' + audioCtx.sampleRate);
+    const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    await audioCtx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+
+    const source = audioCtx.createMediaStreamSource(micStream);
+    workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
+    workletNode.port.onmessage = (e) => {
+        if (socket && connected) {
+            socket.emit('audio_in', e.data);
+        }
+    };
+    source.connect(workletNode);
+    workletNode.connect(audioCtx.destination); // needed to keep processing alive
+}
+
+function stopMic() {
+    if (workletNode) { workletNode.disconnect(); workletNode = null; }
+    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+    if (audioCtx) { audioCtx.close(); audioCtx = null; }
+}
+
+// ── Socket connection ───────────────────────────────────────────────────────
+
+async function connect() {
+    btn.disabled = true;
+    statusEl.textContent = 'Подключение...';
+    log('Connecting to ' + LIVEAUD_URL + '/liveaud');
+
+    try {
+        await startMic();
+    } catch (err) {
+        statusEl.textContent = 'Ошибка микрофона: ' + err.message;
+        log('Mic error: ' + err.message);
+        btn.disabled = false;
+        return;
+    }
+
+    // Connect directly to /liveaud namespace (single connection)
+    const ns = io(LIVEAUD_URL + '/liveaud');
+
+    ns.on('connect', () => {
+        connected = true;
+        statusEl.textContent = '🟢 Подключено — говорите!';
+        btn.textContent = 'Отключить';
+        btn.classList.add('active');
+        btn.disabled = false;
+        log('Connected, sid=' + ns.id);
+    });
+
+    ns.on('audio_out', (data) => {
+        enqueueAudio(data);
+    });
+
+    ns.on('disconnect', () => {
+        connected = false;
+        statusEl.textContent = 'Отключено';
+        btn.textContent = 'Подключить';
+        btn.classList.remove('active');
+        btn.disabled = false;
+        log('Disconnected');
+    });
+
+    ns.on('connect_error', (err) => {
+        statusEl.textContent = 'Ошибка: ' + err.message;
+        log('Error: ' + err.message);
+        btn.disabled = false;
+    });
+
+    socket = ns;
+}
+
+function disconnect() {
+    if (socket) { socket.disconnect(); socket = null; }
+    stopMic();
+    playQueue = [];
+    isPlaying = false;
+    connected = false;
+    statusEl.textContent = 'Не подключено';
+    btn.textContent = 'Подключить';
+    btn.classList.remove('active');
+    log('Disconnected manually');
+}
+
+// ── Button ──────────────────────────────────────────────────────────────────
+
+btn.disabled = false;
+btn.addEventListener('click', () => {
+    if (connected) {
+        disconnect();
+    } else {
+        connect();
+    }
+});
+</script>
+</body>
+</html>
